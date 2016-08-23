@@ -80,65 +80,24 @@ to disk.
 // convention.
 const async_wrap = require('async_wrap');
 
-// List of asynchronous subsystems (e.g. CRYPTO or NET). Can be used for trace
-// filtering of events.
-const subsystems = async_wrap.subsystems;
-
-// Return the list of classes that can call init(). For example, `TCPWRAP`.
-const classes = async_wrap.classes;
-
-// Pass in the class string passed to init() to retrieve the subsystem that
-// class is associated with.
-const subsystem = async_wrap.getSubsystemOf(class);
-
-// Return the id of the current parent. Useful for tracking state and
-// retrieving the handle of the current parent without needing to use an
+// Return the id of the current execution context. Useful for tracking state
+// and retrieving the handle of the current parent without needing to use an
 // AsyncHook().
-const id = async_wrap.currentParentId();
+const id = async_wrap.currentId();
+
+// Pass in a handle and return that handles id.
+// TODO: handles need a standard way of extracting their ids if this is going
+// to work.
+const id = async_wrap.getHandlesId(handle);
 
 // Retrieve a handle by its id. The id will have been passed to the init()
-// callback. Reason for this API is to prevent users from holding references
-// to the handles themselves. Thus possibly preventing GC from cleaning up
-// the handle and ever firing the destroy() callback.
+// callback. This API exists to allow users to reference handles without
+// accidentally retaining a reference to that handle after all othre locations
+// have been cleaned up.
 const handle = async_wrap.getHandleById(n);
-
-// XXX: API that allows you to get the API from an existing handle. This will be
-// necessary to retrieve the id for a given handle for APIs like
-// server.on('connection'. Investigate how plausible this is, and if it would
-// be useful. Possibly have it be a getter on the FunctionTemplate.
-const id = async_wrap.getHandleId(handle);
-
-// init() is called during object construction. The handle will have not
-// completed construction when this callback runs. So not all fields will have
-// populated.
-function init(id, type, parentId) { }
-
-// before() is called just before the handle's callback is called. It can be
-// called 0-N times for handles (e.g. TCPWRAP), and should be called exactly 1
-// time for requests (e.g. FSREQWRAP).
-// XXX: Why shouldn't the before callback be passed the callback that's about to
-// be executed. Or at least some other data about the callback.
-
-function before(id) { }
-
-// after() is called just after the handle's callback has finished, and will be
-// called regardless whether the handle's callback threw. If the handle's
-// callback did throw then hasThrown will be true.
-function after(id, hasThrown) { }
-
-// destroy() is called when an AsyncWrap instance is destroyed. In cases like
-// HTTPPARSER where the resource is reused, or timers where the handle is only
-// a JS object, destroy() will be triggered manually soon after after() has
-// completed.
-function destroy(id) { }
 
 // Create a new instance and add each callback to the corresponding hook.
 var asyncHook = new AsyncHook({ init, before, after, destroy });
-
-// Enable hooks for the current synchronous execution scope. This will ensure
-// the hooks are not in effect in case of multiple returns, or if an exception
-// is thrown.
-asyncHook.scope();
 
 // Allow callbacks of this AsyncHook instance to fire. This is not an implicit
 // action after running the constructor, and must be explicitly run to begin
@@ -150,10 +109,35 @@ asyncHook.enable();
 // the scope of an enabled AsyncHook instance.
 asyncHook.disable();
 
+// Enable hooks for the current synchronous execution scope. This will ensure
+// the hooks are not in effect in case of multiple returns, or if an exception
+// is thrown.
+asyncHook.syncScope();
+
 // Unlike disable(), prevent any hook callback from firing again in the future.
-// Future hooks can be added by running scope()/enable() again.
-// TODO: I am not sure all of this is possible. Investigation is needed.
+// Future hooks can be added by running syncScope()/enable() again.
+// TODO: Investigation is needed to know whether this is possible.
 asyncHook.remove();
+
+// init() is called during object construction. The handle may not have
+// completed construction when this callback runs. So all fields of the
+// handle referenced by "id" may not have been populated.
+function init(id, ctor_name, parentId) { }
+
+// before() is called just before the handle's callback is called. It can be
+// called 0-N times for handles (e.g. TCPWrap), and should be called exactly 1
+// time for requests (e.g. FSReqWrap).
+function before(id) { }
+
+// after() is called just after the handle's callback has finished, and will be
+// called regardless whether the handle's callback threw.
+function after(id) { }
+
+// destroy() is called when an AsyncWrap instance is destroyed. In cases like
+// HTTPParser where the resource is reused, or timers where the handle is only
+// a JS object, destroy() will be triggered manually soon after after() has
+// completed.
+function destroy(id) { }
 ```
 
 
@@ -162,24 +146,22 @@ asyncHook.remove();
 The object returned from `require('async_wrap')`.
 
 
-#### `async_wrap.subsystems`
+#### `async_wrap.currentId()`
 
-List of all subsystems that may trigger the `init` callback. Some of these
-include `NET`, `CRYPTO` or `TIMER`. Each subsystem relates to one or more
-classes. One thing these are useful for is quick filtering of `init()` calls
-and determining if information should be logged, etc.
+Return the id of the current execution context. Useful to track the
+asynchronous execution chain. It can also be used to propagate state without
+needing to use the `AsyncHook` constructor. For example:
 
-#### `async_wrap.classes`
+```js
+const map = new Map();
 
-List of classes that can trigger `init()`. These are the names of the classes
-instantiated to perform a given asynchronous task. Some of these include
-`TCPWRAP`, `PIPEWRAP` or `HTTPPARSER`. One thing these are useful for is to
-know how to transverse the handle for inspection.
+net.createServer((c) => {
+  // TODO: In order for this to be useful it needs to be possible to get the
+  // id of a given handle. Otherwise it'll be impossible to store state at
+  // moments like this for later usage using the handle's id.
+}).listen(8111);
+```
 
-#### `async_wrap.getSubsystemOf(class)`
-
-Returns the subsystem of the `class`. The `init()` callback passes the `class`
-of the caller. To retrieve the subsystem of the `class` use `getSubsystemOf()`.
 
 #### `async_wrap.getHandleById(id)`
 
@@ -209,19 +191,19 @@ passed to `.listen()` then a DNS lookup needs to be performed. Until this
 operation is complete no fd can be assigned to the `TCPWrap` instance.
 
 
-### Constructor: `AsyncHook`
+### Constructor: `AsyncHook(callbacks)`
 
 The `AsyncHook` constructor returns an instance that contains information about
 the callbacks that are to fire during specific asynchronous events in the
 lifetime of the event loop. The focal point of these calls centers around the
 lifetime of `AsyncWrap`. These callbacks will also be called to emulate the
 lifetime of handles and requests that do not fit this model. For example,
-`HTTPPARSER` instances are recycled to improve performance. So the `destroy()`
-callback would be called manually after a connection is done using it, just
+`HTTPParser` instances are recycled to improve performance. So the `destroy()`
+callback would be called manually after a connection is done using it. Just
 before it's placed back into the unused resource pool.
 
-All callbacks are optional. So if only resource cleanup needs to be tracked
-then only the `destroy()` callback needs to be passed.
+All callbacks are optional. So, for example, if only resource cleanup needs to
+be tracked then only the `destroy()` callback needs to be passed.
 
 **Error Handling**: If any callback throws the application will print the stack
 trace and exit. The exit path does follow that of any uncaught exception,
@@ -230,63 +212,40 @@ so any `'exit'` callbacks will fire. Unless the application is run with
 `--abort-on-uncaught-exception`. In which case a stack trace will be printed
 and the application will exit, leaving a core file.
 
-The reason for this behavior is that these callbacks are running at potentially
-volatile points in an object's lifetime. For example during class construction
-and destruction. Because of this, it is deemed necessary to bring down the
-process quickly as to prevent an unintentional abort in the future. This is
-subject to change in the future if a comprehensive analysis is performed to
-ensure an exception can follow the normal control flow without unintentional
-side effects.
-
-
-#### `asyncHook.scope()`
-
-Enable capture of asynchronous events until the current synchronous code
-execution has completed. This is basically a small amount of sugar to prevent
-accidentally forgetting to `disable()` a set of hooks in a function with
-multiple returns. Also in case an error is thrown and caught by a domain or
-`uncaughtException`.
-
-Say an application only wishes to observe the asynchronous calls made from
-another asynchronous callback. Without `scope()` the call would look like so:
-
-```js
-fs.readFile(path, (err, data) => {
-  asyncHook.enable();
-  var e = asyncDataProcessing(data);
-  if (e) {
-    asyncHook.disable();
-    return;
-  }
-  doMoreAsyncStuff();
-  asyncHook.disable();
-});
-```
-
-But using `scope()` all of that is handled for you:
-
-```js
-fs.readFile(path, (err, data) => {
-  asyncHook.scope();
-  var e = asyncDataProcessing(data);
-  if (e)
-    return;
-  doMoreAsyncStuff();
-});
-```
+The reason for this error handling behavior is that these callbacks are running
+at potentially volatile points in an object's lifetime. For example during
+class construction and destruction. Because of this, it is deemed necessary to
+bring down the process quickly as to prevent an unintentional abort in the
+future. This is subject to change in the future if a comprehensive analysis is
+performed to ensure an exception can follow the normal control flow without
+unintentional side effects.
 
 
 #### `asyncHook.enable()`
 
 Enable the callbacks for a given `AsyncHook` instance. Once a callback fires on
 an asynchronous event they will continue to fire for all nested asynchronous
-events. Even after the instance has been disabled.
+events. Even after the instance has been disabled. The following is an example
+of how this operates:
+
+```js
+const async_wrap = require('async_wrap');
+const hooks = new async_wrap.AsyncHook({ init });
+hooks.enable();
+
+net.createServer((c) => {
+  // Even though the hooks have been disabled by the time this callback runs
+  // the callbacks attached to "hooks" will still fire.
+});
+
+hooks.disable();
+```
 
 Callbacks are not implicitly enabled after an instance is created. The reason
 for this is to not make any assumptions about the user's use case. Since
 constructing the `asyncHook` during startup, but not using it until later is, a
-perfectly reasonable use case. This API is meant to err on the side of
-requiring explicit instructions from the user.
+reasonable use case. This API is meant to err on the side of requiring explicit
+instructions from the user.
 
 
 #### `asyncHook.disable()`
@@ -296,7 +255,29 @@ the `init()`, etc., calls from firing for any new roots of asynchronous call
 stacks, but will not prevent existing asynchronous call stacks that have
 already been captured by the `AsyncHook` instance from continuing to fire.
 
-While not part of the immediate development plan, it should be possible in the
+Be careful to always disable the hooks when they are no longer needed.
+Especially in cases where there are multiple return statements. If the hooks
+are not disabled then they will stay active indefinitely. The following is an
+example of how a call to `disable()` may accidentally left out:
+
+```js
+const hooks = new async_wrap.AsyncHook(/* ... */);
+
+crypto.randomBytes(1024, (err, data) => {
+  hooks.enable();
+  try {
+    fs.writeFileSync(path, data);
+  } catch (e) {
+    console.error('file write failed');
+    // Notice the early return and failure to run hooks.disable(), which will
+    // allow the hooks callbacks to continue firing indefinitely.
+    return;
+  }
+  hooks.disable();
+});
+```
+
+While not included as part of initial development, it should be possible in the
 future to allow selective tracking of asynchronous call stacks. The following
 example demonstrates this:
 
@@ -317,6 +298,69 @@ net.createServer((c) => {
 
 At which point no further calls to the hooks on that instance will be made for
 that asynchronous branch.
+
+
+#### `asyncHook.syncScope()`
+
+Enable capture of asynchronous events until the current synchronous code
+execution has completed. This is basically a small amount of sugar to prevent
+accidentally forgetting to `disable()` a set of hooks in a function with
+multiple returns. Also in case an error is thrown and caught by a domain or
+`uncaughtException`.
+
+Say an application only wishes to observe the asynchronous calls made from
+another asynchronous callback. Without `syncScope()` the call would look like
+so:
+
+```js
+fs.readFile(path, (err, data) => {
+  asyncHook.enable();
+  var e = asyncDataProcessing(data);
+  if (e) {
+    asyncHook.disable();
+    return;
+  }
+  doMoreAsyncStuff();
+  asyncHook.disable();
+});
+```
+
+But using `syncScope()` all of that is handled for you:
+
+```js
+fs.readFile(path, (err, data) => {
+  asyncHook.syncScope();
+  var e = asyncDataProcessing(data);
+  if (e)
+    return;
+  doMoreAsyncStuff();
+});
+```
+
+**Note**: Notice that this specifically states the synchronous scope. Not the
+function scope. So if this is used several call stacks deep keep in mind that
+the hooks will be enabled until the stack completely unwinds.
+
+
+#### `asyncHook.remove()`
+
+Unlike `disable()`, `remove()` prevents the callbacks from firing again.
+Regardless of whether they have been attached to an asynchronous execution
+chain or not.
+
+```js
+net.createServer((c) => {
+  asyncHook.syncScope();
+  c.on('data', (chunk) => {});
+  c.on('end', () => {});
+});
+
+setTimeout(() => {
+  // All new connections that have attached asyncHooks created in the last five
+  // seconds will not fire again.
+  asyncHook.remove();
+}, 5000);
+```
 
 
 ### Hook Callbacks
@@ -351,7 +395,13 @@ in the 64-bit IEEE 754 that ECMAScript defines as the **Number** type, the
 number of id's that can be assigned are `2^53 - 1` (also defined as
 `Number.MAX_SAFE_INTEGER`). At this size node can assign a new id every 100
 nanoseconds and not run out for over 28 years. Because of this circumstance it
-is not deemed necessary to find an alternative approach.
+is not deemed necessary to use an alternative approach that would account for
+the id to wrap around.
+
+The `type` is a String that represents the type of handle that caused `init()`
+to fire. Generally it will be the name of the handle's constructor. Some
+examples include `TCP`, `GetAddrInfo` and `HTTPParser`. Users will be able to
+define their own `type` when using the public API.
 
 `parentId` is the unique id of either the async resource at the top of the JS
 stack when `init()` was called, or the originator of the new resource. For
@@ -362,35 +412,23 @@ manually passed to the client's constructor and propagated to the `init()`'s
 `parentId`.
 
 
-#### `before(id, entryPoint)`
+#### `before(id)`
 
 * `id` {Number}
-* `entryPoint` {Function}
 
 Called just before the return callback is called after completing an
 asynchronous request. Or called on handles with events such as receiving a new
 connection. For requests, such as `fs.open()`, this should be called exactly
 once. For handles, such as a TCP server, this may be called 0-N times.
 
-The `entryPoint` is the callback that will be executed immediately after
-`before()` returns. This is being passed as a way to track what work will be
-done.
 
-**Note(trevnorris):** I'm not sure passing only `entryPoint` is useful. Since
-the arguments of the function to be called will be available it may be useful
-to pass those to `before()` as well. Though I have reservations about the user
-being able to mess with non-primitives.
-
-
-#### `after(id, didThrow)`
+#### `after(id)`
 
 * `id` {Number}
-* `didThrow` {Boolean}
 
-Called immediately after the return callback is completed. If the callback
-threw but was caught by a domain or `uncaughtException`, `didThrow` will be set
-to `true`. If the callback threw but was not caught then the process will exit
-immediately without calling `after()`.
+Called immediately after the return callback is completed. If a callback throws
+but is not caught then the process will exit immediately without calling
+`after()`.
 
 
 #### `destroy(id)`
@@ -404,6 +442,91 @@ triggered by GC. In the case of shared or cached resources, such as
 `HTTPParser`, `destroy()` will be called manually when the TCP connection is no
 longer in need of it. Every subsequent use of a shared resource will have a new
 unique id.
+
+
+## Embedder API
+
+Library developers that handle their own I/O will need to hook into the
+`AsyncWrap` API so that all the appropriate callbacks are called. To
+accommodate this both a C++ and JS API is provided.
+
+
+### Native API
+
+```cpp
+// Helper class users can inherit from, but is not necessary. It will
+// automatically call all four callbacks.
+class AsyncHook {
+  public:
+    AsyncHook(Local<Object> handle, const char* name);
+    ~AsyncHook();
+    MaybeLocal<Value> MakeCallback(
+        const Local<Function> callback,
+        int argc,
+        Local<Value>* argv);
+    Local<Object> handle();
+    uint64_t get_uid();
+  private:
+    AsyncHook();
+    Persistent<Object> handle_;
+    const char* name_;
+    uint64_t uid_;
+}
+
+// Returns the id of the current execution context. If the return value is
+// zero then no execution has been set. This will happen if the user handles
+// I/O from native code.
+uint64_t node::GetCurrentId();
+
+// If the native API doesn't inherit from the helper class then the callbacks
+// must be triggered manually. This triggers the init() callback. The return
+// value is the uid assigned to the handle.
+// TODO(trevnorris): This always needs to be called so that the handle can be
+// placed on the Map for future query.
+uint64_t node::EmitAsyncHandleInit(Local<Object> handle);
+
+// Emit the destroy() callback.
+void node::EmitAsyncHandleDestroy(uint64_t id);
+
+// An API specific to emit before/after callbacks is unnecessary because
+// MakeCallback will automatically call them for you.
+MaybeLocal<Value> node::MakeCallback(Isolate* isolate,
+                                     Local<Object> recv,
+                                     Local<Function> callback,
+                                     uint64_t id,
+                                     int argc,
+                                     Local<Value>* argv);
+```
+
+
+### JS API
+
+There is also a JS API to allow for conceptual correctness. For example, if a
+request batches calls under the hood this would still allow for each request
+to trigger the callbacks individually so that the callback associated with
+each bach request execute inside the correct parent.
+
+This cannot be enforced in any way. It is up to the implementer to make sure
+all of the callbacks are placed and called at the correct time.
+
+```js
+// Returns a new uid incremented from an internal global field.
+async_wrap.newUid();
+
+// Here require the "handle" object is passed so it can be maintained in the
+// Map of handles.
+async_wrap.emitInit(id, handle);
+
+// If the "parent" is different for this call than the current parent id then
+// pass in a new parent_id.
+async_wrap.emitBefore(id[, parent_id]);
+
+async_wrap.emitAfter(id);
+
+// The "handle" in the Map will be removed on emitDestroy(). If this is not
+// called then it will lead to a memory leak.
+async_wrap.emitDestroy(id);
+```
 
 
 ## API Exceptions
@@ -440,6 +563,6 @@ implementation.
 
 When data is written through `StreamWrap` node first attempts to write as much
 to the kernel as possible. If all the data can be flushed to the kernel then
-the function exists without creating a `WriteWrap` and calls the user's callback
-in `nextTick()`. Meaning the user would never be notified of data being written
-because the entire operation was synchronous. Is this problematic?
+the function exists without creating a `WriteWrap` and calls the user's
+callback in `nextTick()`. Meaning detection of the write won't be as
+straightforward as watching for a `WriteWrap`.
