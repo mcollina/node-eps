@@ -85,17 +85,6 @@ const async_wrap = require('async_wrap');
 // AsyncHook().
 const id = async_wrap.currentId();
 
-// Pass in a handle and return that handles id.
-// TODO: handles need a standard way of extracting their ids if this is going
-// to work.
-const id = async_wrap.getHandlesId(handle);
-
-// Retrieve a handle by its id. The id will have been passed to the init()
-// callback. This API exists to allow users to reference handles without
-// accidentally retaining a reference to that handle after all othre locations
-// have been cleaned up.
-const handle = async_wrap.getHandleById(n);
-
 // Create a new instance and add each callback to the corresponding hook.
 var asyncHook = new AsyncHook({ init, before, after, destroy });
 
@@ -122,7 +111,7 @@ asyncHook.remove();
 // init() is called during object construction. The handle may not have
 // completed construction when this callback runs. So all fields of the
 // handle referenced by "id" may not have been populated.
-function init(id, ctor_name, parentId) { }
+function init(id, type, parentId, handle) { }
 
 // before() is called just before the handle's callback is called. It can be
 // called 0-N times for handles (e.g. TCPWrap), and should be called exactly 1
@@ -161,34 +150,6 @@ net.createServer((c) => {
   // moments like this for later usage using the handle's id.
 }).listen(8111);
 ```
-
-
-#### `async_wrap.getHandleById(id)`
-
-Some handles are cleaned up by the garbage collector. Preventing the user from
-being able to store those handles for future reference. Instead node keeps
-internal references to each handle that aren't affected by GC. They can then be
-retrieved via the `id` passed to all `AsyncHook` callbacks.
-
-Retrieval of each handle during the `init` or `destroy` callback will return
-an incomplete object, since some of the properties will have been removed. It
-should, however, be safe to inspect at any time. To view a complete handle as
-soon as possible it is recommended to place the code in a `nextTick()`:
-
-```js
-function init(id) {
-  process.nextTick(() => {
-    // Print out the completed handle.
-    console.log(async_wrap.getHandleById(id));
-  });
-}
-```
-
-This pattern likely more useful than simply attempting to view the handle
-during construction. Because handles at times need to have another operation
-complete before the handle is fully constructed. For example if a hostname is
-passed to `.listen()` then a DNS lookup needs to be performed. Until this
-operation is complete no fd can be assigned to the `TCPWrap` instance.
 
 
 ### Constructor: `AsyncHook(callbacks)`
@@ -371,11 +332,12 @@ instance is destructed. For cases where resources are reused, instantiation and
 destructor calls are emulated.
 
 
-#### `init(id, type, parentId)`
+#### `init(id, type, parentId, handle)`
 
 * `id` {Number}
 * `type` {String}
 * `parentId` {Number}
+* `handle` {Object}
 
 Called when a class is constructed that has the possibility to trigger an
 asynchronous event. This does not mean the instance will trigger a
@@ -410,6 +372,13 @@ available when the connection's constructor is executed. Meaning there would be
 no `parentId` available on the JS stack. Instead the TCP server's unique id is
 manually passed to the client's constructor and propagated to the `init()`'s
 `parentId`.
+
+The constructed `handle` is passed to `init()`. The structure of any object
+passed to `init()` has no guarantee of stability, even through patch updates.
+It's meant to be used for debugging the application when additional, and
+specific, information is needed. Make sure not to hold a reference to this
+indefinitely or else the GC won't be able to collect it after node has removed
+its own reference to the handle.
 
 
 #### `before(id)`
