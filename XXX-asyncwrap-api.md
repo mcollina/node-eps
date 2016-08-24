@@ -85,8 +85,11 @@ const async_wrap = require('async_wrap');
 // AsyncHook().
 const id = async_wrap.currentId();
 
+// Generate new uid for user API.
+const id = async_wrap.newUid();
+
 // Create a new instance and add each callback to the corresponding hook.
-var asyncHook = new AsyncHook({ init, before, after, destroy });
+var asyncHook = new async_wrap.AsyncHook({ init, before, after, destroy });
 
 // Allow callbacks of this AsyncHook instance to fire. This is not an implicit
 // action after running the constructor, and must be explicitly run to begin
