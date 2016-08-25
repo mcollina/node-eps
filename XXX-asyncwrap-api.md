@@ -85,9 +85,6 @@ const async_wrap = require('async_wrap');
 // AsyncHook().
 const id = async_wrap.currentId();
 
-// Generate new uid for user API.
-const id = async_wrap.newUid();
-
 // Create a new instance and add each callback to the corresponding hook.
 var asyncHook = new async_wrap.AsyncHook({ init, before, after, destroy });
 
@@ -160,21 +157,21 @@ net.createServer((c) => {
 The `AsyncHook` constructor returns an instance that contains information about
 the callbacks that are to fire during specific asynchronous events in the
 lifetime of the event loop. The focal point of these calls centers around the
-lifetime of `AsyncWrap`. These callbacks will also be called to emulate the
-lifetime of handles and requests that do not fit this model. For example,
-`HTTPParser` instances are recycled to improve performance. So the `destroy()`
-callback would be called manually after a connection is done using it. Just
-before it's placed back into the unused resource pool.
+lifetime of the `AsyncWrap` C++ class. These callbacks will also be called to
+emulate the lifetime of handles and requests that do not fit this model. For
+example, `HTTPParser` instances are recycled to improve performance. So the
+`destroy()` callback would be called manually after a connection is done using
+it. Just before it's placed back into the unused resource pool.
 
 All callbacks are optional. So, for example, if only resource cleanup needs to
 be tracked then only the `destroy()` callback needs to be passed.
 
-**Error Handling**: If any callback throws the application will print the stack
-trace and exit. The exit path does follow that of any uncaught exception,
-except for the fact that it is not catchable by an uncaught exception handler,
-so any `'exit'` callbacks will fire. Unless the application is run with
-`--abort-on-uncaught-exception`. In which case a stack trace will be printed
-and the application will exit, leaving a core file.
+**Error Handling**: If any `AsyncHook` callbacks throw the application will
+print the stack trace and exit. The exit path does follow that of any uncaught
+exception, except for the fact that it is not catchable by an uncaught
+exception handler, so any `'exit'` callbacks will fire. Unless the application
+is run with `--abort-on-uncaught-exception`. In which case a stack trace will
+be printed and the application will exit, leaving a core file.
 
 The reason for this error handling behavior is that these callbacks are running
 at potentially volatile points in an object's lifetime. For example during
@@ -200,7 +197,7 @@ hooks.enable();
 net.createServer((c) => {
   // Even though the hooks have been disabled by the time this callback runs
   // the callbacks attached to "hooks" will still fire.
-});
+}).listen(8080);
 
 hooks.disable();
 ```
@@ -326,6 +323,9 @@ setTimeout(() => {
 }, 5000);
 ```
 
+After `remove()` is run the `asyncHook` will operate normally, and as if it had
+never run `enable()` in the past
+
 
 ### Hook Callbacks
 
@@ -366,7 +366,7 @@ the id to wrap around.
 The `type` is a String that represents the type of handle that caused `init()`
 to fire. Generally it will be the name of the handle's constructor. Some
 examples include `TCP`, `GetAddrInfo` and `HTTPParser`. Users will be able to
-define their own `type` when using the public API.
+define their own `type` when using the public embedder API.
 
 `parentId` is the unique id of either the async resource at the top of the JS
 stack when `init()` was called, or the originator of the new resource. For
@@ -482,22 +482,19 @@ This cannot be enforced in any way. It is up to the implementer to make sure
 all of the callbacks are placed and called at the correct time.
 
 ```js
-// Returns a new uid incremented from an internal global field.
-async_wrap.newUid();
-
 // Here require the "handle" object is passed so it can be maintained in the
-// Map of handles.
-async_wrap.emitInit(id, handle);
+// Map of handles. The return value is the new id of the async event.
+const id = async_wrap.emitInit(handle[, parent_id]);
 
 // If the "parent" is different for this call than the current parent id then
 // pass in a new parent_id.
 async_wrap.emitBefore(id[, parent_id]);
 
-async_wrap.emitAfter(id);
+async_wrap.emitAfter(id[, parent_id]);
 
 // The "handle" in the Map will be removed on emitDestroy(). If this is not
 // called then it will lead to a memory leak.
-async_wrap.emitDestroy(id);
+async_wrap.emitDestroy(id[, parent_id]);
 ```
 
 
