@@ -18,7 +18,7 @@ Node's implementation details, and is in fact intentional. Observing how
 operations are performed, not simply how they appear to perform from the public
 API, is a key point in its usability. For a real world example, a user was
 having difficulty figuring out why their `http.get()` calls were taking so
-long. Because `AsyncHooks` exposed the `dns.lookup()` request to resolve the
+long. Because `AsyncHook` exposed the `dns.lookup()` request to resolve the
 host being made by the `net` module it was trivial to write a performance
 measurement that exposed the hidden culprit. Which was that DNS resolution was
 taking much longer than expected.
@@ -82,11 +82,29 @@ const async_wrap = require('async_wrap');
 
 // Return the id of the current execution context. Useful for tracking state
 // and retrieving the handle of the current parent without needing to use an
-// AsyncHook().
+// AsyncHook.
 const id = async_wrap.currentId();
 
+// Return new AsyncEvent instance. Used to trigger the AsyncHook callbacks.
+const asyncEvent = async_wrap.createEvent(handle[, parent_id]);
+
+// Returns the id assigned to the AsyncEvent instance.
+const id = asyncEvent.getId();
+
+// Trigger init() callbacks.
+asyncEvent.emitInit();
+
+// Trigger before() callbacks.
+asyncEvent.emitBefore();
+
+// Trigger after() callbacks.
+asyncEvent.emitAfter();
+
+// Trigger destroy() callbacks.
+asyncEvent.emitDestroy();
+
 // Create a new instance and add each callback to the corresponding hook.
-var asyncHook = new async_wrap.AsyncHook({ init, before, after, destroy });
+const asyncHook = new async_wrap.createHook({ init, before, after, destroy });
 
 // Allow callbacks of this AsyncHook instance to fire. This is not an implicit
 // action after running the constructor, and must be explicitly run to begin
@@ -152,9 +170,12 @@ net.createServer((c) => {
 ```
 
 
-### Constructor: `AsyncHook(callbacks)`
+#### `async_wrap.createHook(callbacks)`
 
-The `AsyncHook` constructor returns an instance that contains information about
+* `callbacks` {Object}
+* Return: {AsyncHook}
+
+`createHook()` returns an `AsyncHook` instance that contains information about
 the callbacks that are to fire during specific asynchronous events in the
 lifetime of the event loop. The focal point of these calls centers around the
 lifetime of the `AsyncWrap` C++ class. These callbacks will also be called to
@@ -222,7 +243,7 @@ are not disabled then they will stay active indefinitely. The following is an
 example of how a call to `disable()` may accidentally left out:
 
 ```js
-const hooks = new async_wrap.AsyncHook(/* ... */);
+const hooks = async_wrap.createHook(/* ... */);
 
 crypto.randomBytes(1024, (err, data) => {
   hooks.enable();
@@ -481,21 +502,91 @@ each bach request execute inside the correct parent.
 This cannot be enforced in any way. It is up to the implementer to make sure
 all of the callbacks are placed and called at the correct time.
 
-```js
-// Here require the "handle" object is passed so it can be maintained in the
-// Map of handles. The return value is the new id of the async event.
-const id = async_wrap.emitInit(handle[, parent_id]);
 
-// If the "parent" is different for this call than the current parent id then
-// pass in a new parent_id.
-async_wrap.emitBefore(id[, parent_id]);
+#### `async_wrap.createEvent(handle[, parent_id])`
 
-async_wrap.emitAfter(id[, parent_id]);
+* `handle` {Object}
+* `parent_id` {Number} **Default:** `async_wrap.currentId()`
+* Return: {AsyncEvent}
 
-// The "handle" in the Map will be removed on emitDestroy(). If this is not
-// called then it will lead to a memory leak.
-async_wrap.emitDestroy(id[, parent_id]);
+Returns an instance of `AsyncEvent` to be used to trigger `AsyncHook` callback.
+
+`handle` is the object instance that's passed to `init()`.
+
+`parent_id` is the value passed as `parentId` to `init()`. If omitted then the
+current async id is used.
+
+An instance of `AsyncEvent` is returned that is to be used to trigger the
+`AsyncHook` callbacks.
+
+
+#### `event.getId()`
+
+* Return: {Number}
+
+Returns the unique id assigned to the instance when it was created.
+
+Would be easier to just slap on the number, but right now I'm not 100% sure
+that the implementation won't change in the future. So sticking with this.
+
+
+#### `event.emitInit()`
+
+* Return: {Undefined}
+
+Trigger listening `init()` callbacks that this event has been created.  Will
+throw if `emitInit()` is called twice.
+
+
+#### `event.emitBefore()`
+
+* Return: {Undefined}
+
+Trigger listening `before()` callbacks that the `handle` is about to enter it's
+call stack.
+
+
+#### `event.emitAfter()`
+
+* Return: {AsyncEvent}
+
+Trigger listening `after()` callbacks that the `handle` has left it's call
+stack.
+
+The `id` call stack should always properly unwind. No two `emitAfter()` calls
+should be crossed. For example:
+
 ```
+init # Foo
+init # Bar
+...
+before # Foo
+before # Bar
+after # Foo   <- Should be called after Bar
+after # Bar
+```
+
+There is no known scenario where this is acceptable. If one is found then this
+restriction may be lifted.
+
+Return value is the calling `AsyncEvent` instance. This is done to make the
+following scenario more simple:
+
+```
+event.emitAfter().emitDestroy();
+```
+
+Because it won't be uncommon that the `event` will be destroyed immediately
+following the `after()` callback has been called.
+
+
+#### `event.emitDestroy()`
+
+* Return: {Undefined}
+
+Trigger listening `destroy()` callbacks that the `handle`'s resources are no
+longer being used, and in cases where the `handle` is attached to native
+resources the underlying class may have been destructed.
 
 
 ## API Exceptions
