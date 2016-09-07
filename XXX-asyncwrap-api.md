@@ -1,19 +1,19 @@
-| Title  | AsyncWrap API |
+| Title  | AsyncHook API |
 |--------|---------------|
 | Author | @trevnorris   |
 | Status | DRAFT         |
-| Date   | 2016-04-05    |
+| Date   | 2016-09-07    |
 
 ## Description
 
-Since its initial introduction along side the `AsyncListener` API, `AsyncWrap`
-has slowly evolved to ensure a generalized API that would serve as a solid base
-for module authors who wished to add listeners to the event loop's life cycle.
-Some of the use cases `AsyncWrap` has covered are long stack traces,
-continuation local storage, profiling of asynchronous requests and resource
-tracking.
+Since its initial introduction along side the `AsyncListener` API, the internal
+class `AsyncWrap` has slowly evolved to ensure a generalized API that would
+serve as a solid base for module authors who wished to add listeners to the
+event loop's life cycle. Some of the use cases `AsyncWrap` has covered are long
+stack traces, continuation local storage, profiling of asynchronous requests
+and resource tracking. Though the public API is now exposed as `'async_hooks'`.
 
-It must be clarified that the `AsyncWrap` API is not meant to abstract away
+It must be clarified that the `AsyncHook` API is not meant to abstract away
 Node's implementation details, and is in fact intentional. Observing how
 operations are performed, not simply how they appear to perform from the public
 API, is a key point in its usability. For a real world example, a user was
@@ -46,7 +46,7 @@ request will be discussed and performed. Meaning, the resulting API may not be
 the same as initially requested, but the user will be able to achieve the same
 end result.
 
-Performance impact of `AsyncWrap` should be zero if not being used, and near
+Performance impact of `AsyncHook` should be zero if not being used, and near
 zero while being used. The performance overhead of `AsyncHook` callbacks
 supplied by the user should account for essentially all the performance
 overhead.
@@ -78,33 +78,15 @@ to disk.
 ```js
 // Standard way of requiring a module. Snake case follows core module
 // convention.
-const async_wrap = require('async_wrap');
+const async_hooks = require('async_hooks');
 
 // Return the id of the current execution context. Useful for tracking state
 // and retrieving the handle of the current parent without needing to use an
 // AsyncHook.
-const id = async_wrap.currentId();
+const id = async_hooks.currentId();
 
-// Return new AsyncEvent instance. Used to trigger the AsyncHook callbacks.
-const asyncEvent = async_wrap.createEvent(handle[, parent_id]);
-
-// Returns the id assigned to the AsyncEvent instance.
-const id = asyncEvent.getId();
-
-// Trigger init() callbacks.
-asyncEvent.emitInit();
-
-// Trigger before() callbacks.
-asyncEvent.emitBefore();
-
-// Trigger after() callbacks.
-asyncEvent.emitAfter();
-
-// Trigger destroy() callbacks.
-asyncEvent.emitDestroy();
-
-// Create a new instance and add each callback to the corresponding hook.
-const asyncHook = new async_wrap.createHook({ init, before, after, destroy });
+// Create a new instance of AsyncHook. All of these callbacks are optional.
+const asyncHook = async_hooks.createHook({ init, before, after, destroy });
 
 // Allow callbacks of this AsyncHook instance to fire. This is not an implicit
 // action after running the constructor, and must be explicitly run to begin
@@ -116,15 +98,12 @@ asyncHook.enable();
 // the scope of an enabled AsyncHook instance.
 asyncHook.disable();
 
-// Enable hooks for the current synchronous execution scope. This will ensure
-// the hooks are not in effect in case of multiple returns, or if an exception
-// is thrown.
-asyncHook.syncScope();
-
 // Unlike disable(), prevent any hook callback from firing again in the future.
 // Future hooks can be added by running syncScope()/enable() again.
-// TODO: Investigation is needed to know whether this is possible.
+// NOTE: Unsure this will make it into the initial release.
 asyncHook.remove();
+
+// The following are the callbacks that can be passed to createHook().
 
 // init() is called during object construction. The handle may not have
 // completed construction when this callback runs. So all fields of the
@@ -136,8 +115,8 @@ function init(id, type, parentId, handle) { }
 // time for requests (e.g. FSReqWrap).
 function before(id) { }
 
-// after() is called just after the handle's callback has finished, and will be
-// called regardless whether the handle's callback threw.
+// after() is called just after the handle's callback has finished, and will
+// always fire. Except in the case of an uncaught exception.
 function after(id) { }
 
 // destroy() is called when an AsyncWrap instance is destroyed. In cases like
@@ -145,32 +124,42 @@ function after(id) { }
 // a JS object, destroy() will be triggered manually soon after after() has
 // completed.
 function destroy(id) { }
+
+// The following calls are specific to the embedder API. If any hook emitter is
+// used then they must all be used to make sure state proceeds correctly.
+
+// Return new unique id for a constructing handle.
+const id = async_hooks.newUid();
+
+// Call the init() callbacks. Returns an instance of AsyncEvent that will be
+// used in other emit calls.
+const event = async_hooks.emitInit(id, handle, type[, parentId[, parentEvent]]);
+
+// Call the before() callbacks. The reason for requiring both arguments is
+// explained in further detail below.
+async_hooks.emitBefore(id, event);
+
+// Call the after() callbacks.
+async_hooks.emitAfter(id, event);
+
+// Call the destroy() callbacks.
+async_hooks.emitDestroy(id, event);
 ```
 
 
-### `async_wrap`
+### `async_hooks`
 
-The object returned from `require('async_wrap')`.
+The object returned from `require('async_hooks')`.
 
 
-#### `async_wrap.currentId()`
+#### `async_hooks.currentId()`
 
 Return the id of the current execution context. Useful to track the
 asynchronous execution chain. It can also be used to propagate state without
-needing to use the `AsyncHook` constructor. For example:
-
-```js
-const map = new Map();
-
-net.createServer((c) => {
-  // TODO: In order for this to be useful it needs to be possible to get the
-  // id of a given handle. Otherwise it'll be impossible to store state at
-  // moments like this for later usage using the handle's id.
-}).listen(8111);
-```
+needing to use the `AsyncHook` constructor.
 
 
-#### `async_wrap.createHook(callbacks)`
+#### `async_hooks.createHook(callbacks)`
 
 * `callbacks` {Object}
 * Return: {AsyncHook}
@@ -185,7 +174,9 @@ example, `HTTPParser` instances are recycled to improve performance. So the
 it. Just before it's placed back into the unused resource pool.
 
 All callbacks are optional. So, for example, if only resource cleanup needs to
-be tracked then only the `destroy()` callback needs to be passed.
+be tracked then only the `destroy()` callback needs to be passed. The
+specifics of all functions that can be passed to `callbacks` is in the section
+`Hook Callbacks`. (TODO(trevnorris): make this a link)
 
 **Error Handling**: If any `AsyncHook` callbacks throw the application will
 print the stack trace and exit. The exit path does follow that of any uncaught
@@ -205,14 +196,21 @@ unintentional side effects.
 
 #### `asyncHook.enable()`
 
+* Return: {AsyncHook} A reference to `asyncHook`.
+
 Enable the callbacks for a given `AsyncHook` instance. Once a callback fires on
 an asynchronous event they will continue to fire for all nested asynchronous
-events. Even after the instance has been disabled. The following is an example
-of how this operates:
+events. An `asyncHook` is automatically disabled at the end of any synchronous
+call stack. The reason for this is because when the following synchronous call
+stack begins it will have its own state to load. Even if that state contains
+nothing.
+
+Though all propagated hooks will continue to fire along the asynchronous call
+stack. Even if `asyncHook` was manually disabled.
 
 ```js
-const async_wrap = require('async_wrap');
-const hooks = new async_wrap.AsyncHook({ init });
+const async_hooks = require('async_hooks');
+const hooks = new async_hooks.AsyncHook({ init });
 hooks.enable();
 
 net.createServer((c) => {
@@ -229,6 +227,15 @@ constructing the `asyncHook` during startup, but not using it until later is, a
 reasonable use case. This API is meant to err on the side of requiring explicit
 instructions from the user.
 
+To help simplify this `enable()` returns the instance of itself so the calls
+can be chained.
+
+```js
+const async_hooks = require('async_hooks');
+
+async_hooks.createHook(callbacks).enable();
+```
+
 
 #### `asyncHook.disable()`
 
@@ -243,7 +250,7 @@ are not disabled then they will stay active indefinitely. The following is an
 example of how a call to `disable()` may accidentally left out:
 
 ```js
-const hooks = async_wrap.createHook(/* ... */);
+const hooks = async_hooks.createHook(/* ... */);
 
 crypto.randomBytes(1024, (err, data) => {
   hooks.enable();
@@ -259,21 +266,20 @@ crypto.randomBytes(1024, (err, data) => {
 });
 ```
 
-While not included as part of initial development, it should be possible in the
-future to allow selective tracking of asynchronous call stacks. The following
-example demonstrates this:
+It is possible to have selective tracking of asynchronous call stacks. The
+following example demonstrates this:
 
 ```js
-const async_wrap = require('async_wrap');
+const async_hooks = require('async_hooks');
 const net = require('net');
 
 // Pretend init, before, after are all defined
-const asyncHook = async_wrap.createHook({ init, before, after });
+const asyncHook = async_hooks.createHook({ init, before, after });
 asyncHook.enable();
 
 net.createServer((c) => {
   // Only want to follow connections that match IP range.
-  if (ipRangeRegExp.test(c.address().address))
+  if (!ipRangeRegExp.test(c.address().address))
     asyncHook.disable();
 }).listen(PORT);
 ```
@@ -282,49 +288,10 @@ At which point no further calls to the hooks on that instance will be made for
 that asynchronous branch.
 
 
-#### `asyncHook.syncScope()`
-
-Enable capture of asynchronous events until the current synchronous code
-execution has completed. This is basically a small amount of sugar to prevent
-accidentally forgetting to `disable()` a set of hooks in a function with
-multiple returns. Also in case an error is thrown and caught by a domain or
-`uncaughtException`.
-
-Say an application only wishes to observe the asynchronous calls made from
-another asynchronous callback. Without `syncScope()` the call would look like
-so:
-
-```js
-fs.readFile(path, (err, data) => {
-  asyncHook.enable();
-  var e = asyncDataProcessing(data);
-  if (e) {
-    asyncHook.disable();
-    return;
-  }
-  doMoreAsyncStuff();
-  asyncHook.disable();
-});
-```
-
-But using `syncScope()` all of that is handled for you:
-
-```js
-fs.readFile(path, (err, data) => {
-  asyncHook.syncScope();
-  var e = asyncDataProcessing(data);
-  if (e)
-    return;
-  doMoreAsyncStuff();
-});
-```
-
-**Note**: Notice that this specifically states the synchronous scope. Not the
-function scope. So if this is used several call stacks deep keep in mind that
-the hooks will be enabled until the stack completely unwinds.
-
-
 #### `asyncHook.remove()`
+
+NOTE: While planned to be implemented, will probably not make the initial
+release.
 
 Unlike `disable()`, `remove()` prevents the callbacks from firing again.
 Regardless of whether they have been attached to an asynchronous execution
@@ -503,52 +470,76 @@ This cannot be enforced in any way. It is up to the implementer to make sure
 all of the callbacks are placed and called at the correct time.
 
 
-#### `async_wrap.createEvent(handle[, parent_id])`
-
-* `handle` {Object}
-* `parent_id` {Number} **Default:** `async_wrap.currentId()`
-* Return: {AsyncEvent}
-
-Returns an instance of `AsyncEvent` to be used to trigger `AsyncHook` callback.
-
-`handle` is the object instance that's passed to `init()`.
-
-`parent_id` is the value passed as `parentId` to `init()`. If omitted then the
-current async id is used.
-
-An instance of `AsyncEvent` is returned that is to be used to trigger the
-`AsyncHook` callbacks.
-
-
-#### `event.getId()`
+#### `async_hooks.newUid()`
 
 * Return: {Number}
 
-Returns the unique id assigned to the instance when it was created.
+Return a new unique id for a given handle from the same pool of unique id's
+used for all internally created handles.
 
-Would be easier to just slap on the number, but right now I'm not 100% sure
-that the implementation won't change in the future. So sticking with this.
+Generally this should be used during object construction. e.g.:
+
+```js
+class MyClass {
+  constructor() {
+    this._event_id = async_hooks.newUid();
+  }
+}
+```
 
 
-#### `event.emitInit()`
+#### `async_hooks.emitInit(id, handle, type[, parentId[, parentEvent]])`
 
-* Return: {Undefined}
+* `id` {Number} Generated by calling `newUid()`
+* `handle` {Object}
+* `type` {String}
+* `parentId` {Number} **Default:** `currentId()`
+* `parentEvent` {Object} **Default:** `undefined`
+* Return: {Object|Null}
 
-Trigger listening `init()` callbacks that this event has been created.  Will
-throw if `emitInit()` is called twice.
+Emit that a handle is being initialized. `id` should be a value returned by
+`async_hooks.newUid()`. Usage will probably be as follows:
+
+```js
+class Foo {
+  constructor() {
+    this.event_id = async_hooks.newUid();
+    this.event_stor = async_hooks.emitInit(this.event_id, this, 'Foo');
+  }
+}
+```
+
+The return value from `emitInit()` is either an instance of the internal
+constructor `AsyncEventStor`. Which will contain the state of all hooks that
+must propagate to future async calls. If there are no hooks that need to
+propagate then the return value will be `null`. Preventing the need of creating
+one additional object for every async constructor, even when hooks aren't being
+used.
+
+In the unusual circumstance that the embedder needs to define a different
+parent id than `currentId()`, they can pass in that id manually. Along with
+the `AsyncEventStor`, if there is one. If no stor is passed then it is assumed
+there are no hooks that need to propagate to the newly created stor.
+
+It is suggested to have `emitInit()` be the last call in the object's
+constructor.
 
 
-#### `event.emitBefore()`
+#### `async_hooks.emitBefore(id, event)`
 
+* `id` {Number} Generated by `newUid()`
+* `event` {AsyncEventStor}
 * Return: {Undefined}
 
 Trigger listening `before()` callbacks that the `handle` is about to enter it's
 call stack.
 
 
-#### `event.emitAfter()`
+#### `async_hooks.emitAfter(id, event)`
 
-* Return: {AsyncEvent}
+* `id` {Number} Generated by `newUid()`
+* `event` {AsyncEventStor}
+* Return: {Undefined}
 
 Trigger listening `after()` callbacks that the `handle` has left it's call
 stack.
@@ -569,19 +560,11 @@ after # Bar
 There is no known scenario where this is acceptable. If one is found then this
 restriction may be lifted.
 
-Return value is the calling `AsyncEvent` instance. This is done to make the
-following scenario more simple:
 
-```
-event.emitAfter().emitDestroy();
-```
+#### `async_hooks.emitDestroy(id, event)`
 
-Because it won't be uncommon that the `event` will be destroyed immediately
-following the `after()` callback has been called.
-
-
-#### `event.emitDestroy()`
-
+* `id` {Number} Generated by `newUid()`
+* `event` {AsyncEventStor}
 * Return: {Undefined}
 
 Trigger listening `destroy()` callbacks that the `handle`'s resources are no
@@ -590,14 +573,6 @@ resources the underlying class may have been destructed.
 
 
 ## API Exceptions
-
-### net Client connection Event
-
-Technically the `before()`/`after()` events of the `'connection'` event for
-`net.Server` would place the server as the active id. Problem is that this is
-not intuitive in how the asynchronous chain would propagate. So instead make
-the client the active id for the duration of the `'connection'` callback.
-
 
 ### Reused Resources
 
