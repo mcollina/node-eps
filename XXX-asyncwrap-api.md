@@ -504,7 +504,7 @@ Emit that a handle is being initialized. `id` should be a value returned by
 class Foo {
   constructor() {
     this.event_id = async_hooks.newUid();
-    this.event_stor = async_hooks.emitInit(this.event_id, this, 'Foo');
+    this.hook_stor = async_hooks.emitInit(this.event_id, this, 'Foo');
   }
 }
 ```
