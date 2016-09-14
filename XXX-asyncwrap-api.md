@@ -26,7 +26,7 @@ taking much longer than expected.
 A small amount of abstraction is necessary to accommodate the conceptual nature
 of the API. For example, the `HTTPParser` is not destructed but instead placed
 into an unused pool to be used later. Even so, at the time it is placed into
-the pool  the `destroy()` callback will run and then the id assigned to that
+the pool the `destroy()` callback will run and then the id assigned to that
 instance will be removed. If that resource is again requested then it will be
 assigned a new id and will run `init()` again.
 
@@ -57,23 +57,25 @@ overhead.
 Because of the potential ambiguity for those not familiar with the terms
 "handle" and "request" they should be well defined.
 
-Handles are a reference to a system resource. The resource handle can be a
-simple identifier, such as a file descriptor, or it can be a pointer that
-allows access to further information, such as `uv_tcp_t`. Realize that the
-latter still relies on a file descriptor, but has been encapsulated in a data
-structure containing additional information that allows the application to work
-with it.
+Handles are a reference to a system resource. Some resources are a simple
+identifier. For example, file system handles are represented by a file
+descriptor. Other handles are represented by libuv as a platform abstracted
+struct, e.g. `uv_tcp_t`. Each handle can be continually reused to access and
+operate on the referenced resource.
 
 Requests are short lived data structures created to accomplish one task. The
-callback for a request should always and only ever fire one time. When the
-assigned task has either completed or encountered an error. Requests are used
-by handles to perform work. Such as accepting a new connection or writing data
-to disk.
+callback for a request should always and only ever fire one time. Which is when
+the assigned task has either completed or encountered an error. Requests are
+used by handles to perform these tasks. Such as accepting a new connection or
+writing data to disk.
 
 
 ## API
 
 ### Overview
+
+Here is a simple overview of the entire API. All of this API is explained in
+more detail further down.
 
 ```js
 // Standard way of requiring a module. Snake case follows core module
@@ -315,13 +317,14 @@ but is not caught then the process will exit immediately without calling
 
 * `id` {Number}
 
-Called either when the class destructor is run, or if the resource is marked as
-free. The destructor will usually run when explicitly called (the case for
-handles) or when a request has completed. In several cases this will be
-triggered by GC. In the case of shared or cached resources, such as
-`HTTPParser`, `destroy()` will be called manually when the TCP connection is no
-longer in need of it. Every subsequent use of a shared resource will have a new
-unique id.
+Called either when the class destructor is run (either when manually triggered
+or cleaned up by the garbage collector), or if the resource is manually marked
+as free. For core classes that have a destructor the callback will fire during
+deconstruction. If called via `emitDestroy()` then it will be called when the
+implementor deems the resource freed.  In the case of shared or cached
+resources, such as `HTTPParser`, `destroy()` will be called manually when the
+TCP connection is no longer in need of it. Every subsequent use of a shared
+resource will have a new unique id.
 
 
 ## Embedder API
@@ -518,17 +521,28 @@ application. This means node will have to synthesize the `init()` and
 `destroy()` calls. Also the id on the class instance will need to be changed
 every time the resource is acquired for use.
 
-For shared resources like `TimerWrap` this is not necessary since there is a
-unique JS handle that will contain the unique id necessary for the calls.
+Though for a shared resource like `TimerWrap` we're not concerned with reassigning
+the id because it isn't directly used by the user. Instead it is used internally
+for JS created handles that are all assigned their own unique id, and each of
+these JS handles are linked to the `TimerWrap` instance.
 
 
 ## Notes
+
+### Native Modules
+
+Existing native modules that call `node::MakeCallback` today will always have
+their parent id as `1`. Which is the root id. There will be two native APIs
+that users can use. One will be a static API and another will be a class that
+users can inherit from.
+
 
 ### Promises
 
 Node currently doesn't have sufficient API to notify calls to Promise
 callbacks. In order to do so node would have to override the native
-implementation.
+implementation. We are currently working with the V8 team to gain access to
+enough internals to integrate Promises into the AsyncWrap API at a future date.
 
 
 ### Immediate Write Without Request
