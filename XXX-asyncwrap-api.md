@@ -2,7 +2,7 @@
 |--------|---------------|
 | Author | @trevnorris   |
 | Status | DRAFT         |
-| Date   | 2016-09-07    |
+| Date   | 2016-09-14    |
 
 ## Description
 
@@ -98,11 +98,6 @@ asyncHook.enable();
 // the scope of an enabled AsyncHook instance.
 asyncHook.disable();
 
-// Unlike disable(), prevent any hook callback from firing again in the future.
-// Future hooks can be added by running syncScope()/enable() again.
-// NOTE: Unsure this will make it into the initial release.
-asyncHook.remove();
-
 // The following are the callbacks that can be passed to createHook().
 
 // init() is called during object construction. The handle may not have
@@ -131,19 +126,22 @@ function destroy(id) { }
 // Return new unique id for a constructing handle.
 const id = async_hooks.newUid();
 
+// Set the current global id.
+async_hooks.setCurrentId(id);
+
 // Call the init() callbacks. Returns an instance of AsyncEvent that will be
 // used in other emit calls.
-const event = async_hooks.emitInit(id, handle, type[, parentId[, parentEvent]]);
+async_hooks.emitInit(id, handle, type[, parentId]);
 
 // Call the before() callbacks. The reason for requiring both arguments is
 // explained in further detail below.
-async_hooks.emitBefore(id, event);
+async_hooks.emitBefore(id);
 
 // Call the after() callbacks.
-async_hooks.emitAfter(id, event);
+async_hooks.emitAfter(id);
 
 // Call the destroy() callbacks.
-async_hooks.emitDestroy(id, event);
+async_hooks.emitDestroy(id);
 ```
 
 
@@ -176,7 +174,7 @@ it. Just before it's placed back into the unused resource pool.
 All callbacks are optional. So, for example, if only resource cleanup needs to
 be tracked then only the `destroy()` callback needs to be passed. The
 specifics of all functions that can be passed to `callbacks` is in the section
-`Hook Callbacks`. (TODO(trevnorris): make this a link)
+`Hook Callbacks`.
 
 **Error Handling**: If any `AsyncHook` callbacks throw the application will
 print the stack trace and exit. The exit path does follow that of any uncaught
@@ -198,28 +196,17 @@ unintentional side effects.
 
 * Return: {AsyncHook} A reference to `asyncHook`.
 
-Enable the callbacks for a given `AsyncHook` instance. Once a callback fires on
-an asynchronous event they will continue to fire for all nested asynchronous
-events. An `asyncHook` is automatically disabled at the end of any synchronous
-call stack. The reason for this is because when the following synchronous call
-stack begins it will have its own state to load. Even if that state contains
-nothing.
+Enable the callbacks for a given `AsyncHook` instance. When a hook is enabled
+it is added to a pool of hooks to execute. These hooks do not propagate with
+a single asynchronous chain but will be completely disabled when `disable()`
+is called.
 
-Though all propagated hooks will continue to fire along the asynchronous call
-stack. Even if `asyncHook` was manually disabled.
-
-```js
-const async_hooks = require('async_hooks');
-const hooks = new async_hooks.AsyncHook({ init });
-hooks.enable();
-
-net.createServer((c) => {
-  // Even though the hooks have been disabled by the time this callback runs
-  // the callbacks attached to "hooks" will still fire.
-}).listen(8080);
-
-hooks.disable();
-```
+Current reason for this is because of the performance impact of tracking hooks
+individually against every handle. Combined with the fact that we're now
+tracking `process.nextTick()` calls. Which are used liberal throughout core.
+These two things placed substantial burden on performance. If full support
+of `nextTick()` was removed or somehow modified then the individual branching
+may be possible.
 
 Callbacks are not implicitly enabled after an instance is created. The reason
 for this is to not make any assumptions about the user's use case. Since
@@ -239,80 +226,9 @@ async_hooks.createHook(callbacks).enable();
 
 #### `asyncHook.disable()`
 
-Disable the callbacks for a given `AsyncHook` instance. Doing this will prevent
-the `init()`, etc., calls from firing for any new roots of asynchronous call
-stacks, but will not prevent existing asynchronous call stacks that have
-already been captured by the `AsyncHook` instance from continuing to fire.
-
-Be careful to always disable the hooks when they are no longer needed.
-Especially in cases where there are multiple return statements. If the hooks
-are not disabled then they will stay active indefinitely. The following is an
-example of how a call to `disable()` may accidentally left out:
-
-```js
-const hooks = async_hooks.createHook(/* ... */);
-
-crypto.randomBytes(1024, (err, data) => {
-  hooks.enable();
-  try {
-    fs.writeFileSync(path, data);
-  } catch (e) {
-    console.error('file write failed');
-    // Notice the early return and failure to run hooks.disable(), which will
-    // allow the hooks callbacks to continue firing indefinitely.
-    return;
-  }
-  hooks.disable();
-});
-```
-
-It is possible to have selective tracking of asynchronous call stacks. The
-following example demonstrates this:
-
-```js
-const async_hooks = require('async_hooks');
-const net = require('net');
-
-// Pretend init, before, after are all defined
-const asyncHook = async_hooks.createHook({ init, before, after });
-asyncHook.enable();
-
-net.createServer((c) => {
-  // Only want to follow connections that match IP range.
-  if (!ipRangeRegExp.test(c.address().address))
-    asyncHook.disable();
-}).listen(PORT);
-```
-
-At which point no further calls to the hooks on that instance will be made for
-that asynchronous branch.
-
-
-#### `asyncHook.remove()`
-
-NOTE: While planned to be implemented, will probably not make the initial
-release.
-
-Unlike `disable()`, `remove()` prevents the callbacks from firing again.
-Regardless of whether they have been attached to an asynchronous execution
-chain or not.
-
-```js
-net.createServer((c) => {
-  asyncHook.syncScope();
-  c.on('data', (chunk) => {});
-  c.on('end', () => {});
-});
-
-setTimeout(() => {
-  // All new connections that have attached asyncHooks created in the last five
-  // seconds will not fire again.
-  asyncHook.remove();
-}, 5000);
-```
-
-After `remove()` is run the `asyncHook` will operate normally, and as if it had
-never run `enable()` in the past
+Disable the callbacks for a given `AsyncHook` instance from the global pool of
+hooks to be executed. Once a hook has been disabled it will not fire again
+until enabled.
 
 
 ### Hook Callbacks
@@ -363,6 +279,10 @@ available when the connection's constructor is executed. Meaning there would be
 no `parentId` available on the JS stack. Instead the TCP server's unique id is
 manually passed to the client's constructor and propagated to the `init()`'s
 `parentId`.
+
+If `parentId` is 1 then the call parent is the bootstrap phase of the
+application. If the `parentId` is 0 then it points to the void and there's a
+problem.
 
 The constructed `handle` is passed to `init()`. The structure of any object
 passed to `init()` has no guarantee of stability, even through patch updates.
@@ -425,35 +345,35 @@ class AsyncHook {
         int argc,
         Local<Value>* argv);
     Local<Object> handle();
-    uint64_t get_uid();
+    int64_t get_uid();
   private:
     AsyncHook();
     Persistent<Object> handle_;
     const char* name_;
-    uint64_t uid_;
+    int64_t uid_;
 }
 
 // Returns the id of the current execution context. If the return value is
 // zero then no execution has been set. This will happen if the user handles
 // I/O from native code.
-uint64_t node::GetCurrentId();
+int64_t node::GetCurrentId();
 
 // If the native API doesn't inherit from the helper class then the callbacks
 // must be triggered manually. This triggers the init() callback. The return
 // value is the uid assigned to the handle.
 // TODO(trevnorris): This always needs to be called so that the handle can be
 // placed on the Map for future query.
-uint64_t node::EmitAsyncHandleInit(Local<Object> handle);
+int64_t node::EmitAsyncHandleInit(Local<Object> handle);
 
 // Emit the destroy() callback.
-void node::EmitAsyncHandleDestroy(uint64_t id);
+void node::EmitAsyncHandleDestroy(int64_t id);
 
 // An API specific to emit before/after callbacks is unnecessary because
 // MakeCallback will automatically call them for you.
 MaybeLocal<Value> node::MakeCallback(Isolate* isolate,
                                      Local<Object> recv,
                                      Local<Function> callback,
-                                     uint64_t id,
+                                     int64_t id,
                                      int argc,
                                      Local<Value>* argv);
 ```
@@ -488,14 +408,13 @@ class MyClass {
 ```
 
 
-#### `async_hooks.emitInit(id, handle, type[, parentId[, parentEvent]])`
+#### `async_hooks.emitInit(id, handle, type[, parentId])`
 
 * `id` {Number} Generated by calling `newUid()`
 * `handle` {Object}
 * `type` {String}
 * `parentId` {Number} **Default:** `currentId()`
-* `parentEvent` {Object} **Default:** `undefined`
-* Return: {Object|Null}
+* Return: {Undefined}
 
 Emit that a handle is being initialized. `id` should be a value returned by
 `async_hooks.newUid()`. Usage will probably be as follows:
@@ -504,41 +423,60 @@ Emit that a handle is being initialized. `id` should be a value returned by
 class Foo {
   constructor() {
     this.event_id = async_hooks.newUid();
-    this.hook_stor = async_hooks.emitInit(this.event_id, this, 'Foo');
+    async_hooks.emitInit(this.event_id, this, 'Foo');
   }
 }
 ```
 
-The return value from `emitInit()` is either an instance of the internal
-constructor `AsyncHookStor`. Which will contain the state of all hooks that
-must propagate to future async calls. If there are no hooks that need to
-propagate then the return value will be `null`. Preventing the need of creating
-one additional object for every async constructor, even when hooks aren't being
-used.
-
 In the unusual circumstance that the embedder needs to define a different
-parent id than `currentId()`, they can pass in that id manually. Along with
-the `AsyncHookStor`, if there is one. If no stor is passed then it is assumed
-there are no hooks that need to propagate to the newly created stor.
+parent id than `currentId()`, they can pass in that id manually.
 
 It is suggested to have `emitInit()` be the last call in the object's
 constructor.
 
 
-#### `async_hooks.emitBefore(id, event)`
+#### `async_hooks.emitBefore(id)`
 
 * `id` {Number} Generated by `newUid()`
-* `event` {AsyncHookStor}
 * Return: {Undefined}
 
-Trigger listening `before()` callbacks that the `handle` is about to enter it's
+Trigger listening `before()` callbacks that the `handle` is about to enter its
 call stack.
 
+It's currently necessary for embedders to manually do a little state
+management.  The following is a template for how the global id state should be
+handled:
 
-#### `async_hooks.emitAfter(id, event)`
+```js
+MyThing.prototype.done = function done() {
+  // First call the before() callbacks. So currentId() shows the id of the
+  // handle wrapping the id that's been passed.
+  async_hooks.emitBefore(this.asyncId);
+
+  // Store the current parent id then set the global current id to the id
+  // that was assigned when this object was instantiated.
+  const previous_id = async_hooks.currentId();
+  async_hooks.setCurrentId(this.asyncId);
+
+  // Run the callback.
+  this.callback();
+
+  // Restore the old id.
+  async_hooks.setCurrentId(previous_id);
+
+  // Call after() callbacks now that the old id has been restored.
+  async_hooks.emitAfter(this.asyncId);
+};
+```
+
+Reason for this is to simplify the internal implementation and reduce overhead.
+If a method can be found to pretty-ify this without incurring additional cost
+then it'll probably be used.
+
+
+#### `async_hooks.emitAfter(id)`
 
 * `id` {Number} Generated by `newUid()`
-* `event` {AsyncHookStor}
 * Return: {Undefined}
 
 Trigger listening `after()` callbacks that the `handle` has left it's call
@@ -561,10 +499,9 @@ There is no known scenario where this is acceptable. If one is found then this
 restriction may be lifted.
 
 
-#### `async_hooks.emitDestroy(id, event)`
+#### `async_hooks.emitDestroy(id)`
 
 * `id` {Number} Generated by `newUid()`
-* `event` {AsyncHookStor}
 * Return: {Undefined}
 
 Trigger listening `destroy()` callbacks that the `handle`'s resources are no
@@ -598,6 +535,6 @@ implementation.
 
 When data is written through `StreamWrap` node first attempts to write as much
 to the kernel as possible. If all the data can be flushed to the kernel then
-the function exists without creating a `WriteWrap` and calls the user's
+the function exits without creating a `WriteWrap` and calls the user's
 callback in `nextTick()`. Meaning detection of the write won't be as
 straightforward as watching for a `WriteWrap`.
