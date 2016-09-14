@@ -11,7 +11,7 @@ class `AsyncWrap` has slowly evolved to ensure a generalized API that would
 serve as a solid base for module authors who wished to add listeners to the
 event loop's life cycle. Some of the use cases `AsyncWrap` has covered are long
 stack traces, continuation local storage, profiling of asynchronous requests
-and resource tracking. Though the public API is now exposed as `'async_hooks'`.
+and resource tracking. The public API is now exposed as `'async_hooks'`.
 
 It must be clarified that the `AsyncHook` API is not meant to abstract away
 Node's implementation details, and is in fact intentional. Observing how
