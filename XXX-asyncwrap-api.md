@@ -249,9 +249,9 @@ destructor calls are emulated.
 * `handle` {Object}
 
 Called when a class is constructed that has the possibility to trigger an
-asynchronous event. This does not mean the instance will trigger a
-`before()`/`after()` event before `destroy()` is called. Only that the
-possibility exists.
+asynchronous event. This does not mean the instance must trigger
+`before()`/`after()` before `destroy()` is called. Only that the possibility
+exists.
 
 This behavior can be observed by doing something like opening a resource then
 closing it before the resource can be used. The following snippet demonstrates
@@ -259,39 +259,124 @@ this.
 
 ```js
 require('net').createServer().listen(8080, function() { this.close() });
+// OR
+clearTimeout(setTimeout(() => {}, 10));
 ```
 
 Every instance is assigned a unique id. Taking advantage of the fraction space
 in the 64-bit IEEE 754 that ECMAScript defines as the **Number** type, the
 number of id's that can be assigned are `2^53 - 1` (also defined as
 `Number.MAX_SAFE_INTEGER`). At this size node can assign a new id every 100
-nanoseconds and not run out for over 28 years. Because of this circumstance it
-is not deemed necessary to use an alternative approach that would account for
-the id to wrap around.
+nanoseconds and not run out for over 28 years. Because of this is it not
+deemed necessary to check for wrap around.
 
 The `type` is a String that represents the type of handle that caused `init()`
 to fire. Generally it will be the name of the handle's constructor. Some
 examples include `TCP`, `GetAddrInfo` and `HTTPParser`. Users will be able to
 define their own `type` when using the public embedder API.
 
-`parentId` is the unique id of either the async resource at the top of the JS
-stack when `init()` was called, or the originator of the new resource. For
-example, when a connection is made to a TCP server there is no JS stack
-available when the connection's constructor is executed. Meaning there would be
-no `parentId` available on the JS stack. Instead the TCP server's unique id is
-manually passed to the client's constructor and propagated to the `init()`'s
-`parentId`.
+When `init()` is called the id that the resource was initialized in can be
+found with `currentId()`. `parentId` is meant to communicate the "conceptual"
+parent of the new handle. In other words the reason for the handle's existence.
 
-If `parentId` is 1 then the call parent is the bootstrap phase of the
-application. If the `parentId` is 0 then it points to the void and there's a
-problem.
+The following is a simple demonstration of this:
 
-The constructed `handle` is passed to `init()`. The structure of any object
-passed to `init()` has no guarantee of stability, even through patch updates.
-It's meant to be used for debugging the application when additional, and
-specific, information is needed. Make sure not to hold a reference to this
-indefinitely or else the GC won't be able to collect it after node has removed
-its own reference to the handle.
+```cpp
+const async_hooks = require('async_hooks');
+const net = require('net');
+
+asyn_hooks.createHook({
+  init: (id, type, parentId) => {
+    const cId = async_hooks.currentId();
+    process._rawDebug(`${type}(${id}): parent: ${parentId} scope: ${cId}`);
+  }
+}).enable();
+
+net.createServer(c => {}).listen(8080);
+```
+
+Output hitting the server with `nc localhost 8080`:
+
+```
+TCPWRAP(2): parent: 1 scope: 1
+TCPWRAP(4): parent: 2 scope: 0
+```
+
+The second `TCPWRAP` is the new connection from the client. When a new
+connection is made the `TCPWrap` instance is immediately constructed. This
+happens outside of any JavaScript stack (side note: a `currentId()` of `0`
+means it's being executed in the void, with no JavaScript stack above it). With
+only that information it would be impossible to link resources together in
+terms of what caused them to be created. So `parentId` is given the task of
+propagating what other handle is responsible for the new resource's existence.
+
+Below is another example with additional information about the calls to
+`init()` between the `before()` and `after()` calls. Specifically what the
+callback to `listen()` will look like. The output formatting is slightly more
+elaborate to make calling context easier to see.
+
+```js
+let ws = 0;
+async_hooks.createHook({
+  init: (id, type, parentId) => {
+    const cId = async_hooks.currentId();
+    process._rawDebug(' '.repeat(ws) +
+                      `${type}(${id}): parent: ${parentId} scope: ${cId}`);
+  },
+  before: (id) => {
+    print(' '.repeat(ws) + 'before: ', id);
+    ws += 2;
+  },
+  after: (id) => {
+    ws -= 2;
+    print(' '.repeat(ws) + 'after:  ', id);
+  },
+}).enable();
+
+net.createServer(() => {}).listen(8080, () => {
+  // Let's wait 10ms before logging the server started.
+  setTimeout(() => {
+    console.log('>>>', async_hooks.currentId());
+  }, 10);
+});
+```
+
+Output from only starting the server:
+
+```
+TCPWRAP(2): parent: 1 scope: 1
+# .listen()
+TickObject(3): parent: 1 scope: 1
+before:  3
+  Timeout(4): parent: 3 scope: 3
+  TIMERWRAP(5): parent: 3 scope: 3
+after:   3
+before:  5
+  before:  4
+    TTYWRAP(6): parent: 4 scope: 4
+    SIGNALWRAP(7): parent: 4 scope: 4
+>>> 4
+  after:   4
+after:   5
+```
+
+If we start at `console.log()` and follow up the resource allocation tree by
+using the `before()`/`after()` calls back to `root(1)` the following graph is
+created (note: an id of `1` is the "root", or the current id of the startup
+phase):
+
+```
+TTYWRAP(6) -> Timeout(4) -> TIMERWRAP(5) -> TickObject(3) -> root(1)
+```
+
+No where here do we see the `TCPWRAP` created, which was the reason for
+`console.log()` being called. The reason for this is that the action of binding
+to a port using `listen(port)` is actually synchronous, but to maintain a
+completely asynchronous API the user's callback is placed in a
+`process.nextTick()`.
+
+The graph only shows **when** a resource was created. Not **why**. The later is
+what `parentId` is meant to communicate.
 
 
 #### `before(id)`
@@ -317,14 +402,19 @@ but is not caught then the process will exit immediately without calling
 
 * `id` {Number}
 
-Called either when the class destructor is run (either when manually triggered
-or cleaned up by the garbage collector), or if the resource is manually marked
-as free. For core classes that have a destructor the callback will fire during
+Called either when the class destructor is run ~~(either when manually triggered
+or cleaned up by the garbage collector)~~, or if the resource is manually marked
+as free. For core C++ classes that have a destructor the callback will fire during
 deconstruction. If called via `emitDestroy()` then it will be called when the
-implementor deems the resource freed.  In the case of shared or cached
+implementor deems the resource freed. In the case of shared or cached
 resources, such as `HTTPParser`, `destroy()` will be called manually when the
 TCP connection is no longer in need of it. Every subsequent use of a shared
 resource will have a new unique id.
+
+**Note:** It was originally intended that GC-able handles could call
+`destroy()` on GC, but since the mechanism to communicate that a handle can be
+removed from a map is the `destroy()` callback itself it is then necessary to
+manually trigger the destroy callback.
 
 
 ## Embedder API
@@ -447,7 +537,7 @@ Trigger listening `before()` callbacks that the `handle` is about to enter its
 call stack.
 
 It's currently necessary for embedders to manually do a little state
-management.  The following is a template for how the global id state should be
+management. The following is a template for how the global id state should be
 handled:
 
 ```js
@@ -550,5 +640,6 @@ enough internals to integrate Promises into the AsyncWrap API at a future date.
 When data is written through `StreamWrap` node first attempts to write as much
 to the kernel as possible. If all the data can be flushed to the kernel then
 the function exits without creating a `WriteWrap` and calls the user's
-callback in `nextTick()`. Meaning detection of the write won't be as
-straightforward as watching for a `WriteWrap`.
+callback in `nextTick()` (which will only be called if the user passes a
+callback). Meaning detection of the write won't be as straightforward as
+watching for a `WriteWrap`.
