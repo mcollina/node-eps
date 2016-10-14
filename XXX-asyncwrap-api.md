@@ -83,9 +83,13 @@ more detail further down.
 const async_hooks = require('async_hooks');
 
 // Return the id of the current execution context. Useful for tracking state
-// and retrieving the handle of the current parent without needing to use an
+// and retrieving the handle of the current trigger without needing to use an
 // AsyncHook.
-const id = async_hooks.currentId();
+const cid = async_hooks.currentId();
+
+// Return the id of the handle responsible for triggering the callback of the
+// current execution scope to fire.
+const tid = aysnc_hooks.triggerId();
 
 // Create a new instance of AsyncHook. All of these callbacks are optional.
 const asyncHook = async_hooks.createHook({ init, before, after, destroy });
@@ -105,7 +109,7 @@ asyncHook.disable();
 // init() is called during object construction. The handle may not have
 // completed construction when this callback runs. So all fields of the
 // handle referenced by "id" may not have been populated.
-function init(id, type, parentId, handle) { }
+function init(id, type, triggerId, handle) { }
 
 // before() is called just before the handle's callback is called. It can be
 // called 0-N times for handles (e.g. TCPWrap), and should be called exactly 1
@@ -133,7 +137,7 @@ async_hooks.setCurrentId(id);
 
 // Call the init() callbacks. Returns an instance of AsyncEvent that will be
 // used in other emit calls.
-async_hooks.emitInit(id, handle, type[, parentId]);
+async_hooks.emitInit(id, handle, type[, triggerId]);
 
 // Call the before() callbacks. The reason for requiring both arguments is
 // explained in further detail below.
@@ -155,8 +159,26 @@ The object returned from `require('async_hooks')`.
 #### `async_hooks.currentId()`
 
 Return the id of the current execution context. Useful to track the
-asynchronous execution chain. It can also be used to propagate state without
-needing to use the `AsyncHook` constructor.
+asynchronous execution chain.
+
+
+#### `async_hooks.triggerId()`
+
+Return the id of the handle responsible for calling the callback of the current
+execution scope. For example:
+
+```js
+const server = net.createServer(conn => {
+  // currentId() returns the id of the handle that's executing
+  // the callback. In this case it's the id of "server".
+  async_hooks.currentId();
+
+  // Though the handle that caused (or triggered) this callback to
+  // be called was that of the new connection. Thus the return value
+  // of triggerId() is the id of "conn".
+  async_hooks.triggerId();
+}).listen();
+```
 
 
 #### `async_hooks.createHook(callbacks)`
@@ -241,11 +263,11 @@ instance is destructed. For cases where resources are reused, instantiation and
 destructor calls are emulated.
 
 
-#### `init(id, type, parentId, handle)`
+#### `init(id, type, triggerId, handle)`
 
 * `id` {Number}
 * `type` {String}
-* `parentId` {Number}
+* `triggerId` {Number}
 * `handle` {Object}
 
 Called when a class is constructed that has the possibility to trigger an
@@ -276,8 +298,8 @@ examples include `TCP`, `GetAddrInfo` and `HTTPParser`. Users will be able to
 define their own `type` when using the public embedder API.
 
 When `init()` is called the id that the resource was initialized in can be
-found with `currentId()`. `parentId` is meant to communicate the "conceptual"
-parent of the new handle. In other words the reason for the handle's existence.
+found with `currentId()`. `triggerId` is the id of the resource responsible for
+`init()` being called.
 
 The following is a simple demonstration of this:
 
@@ -286,9 +308,9 @@ const async_hooks = require('async_hooks');
 const net = require('net');
 
 asyn_hooks.createHook({
-  init: (id, type, parentId) => {
+  init: (id, type, triggerId) => {
     const cId = async_hooks.currentId();
-    process._rawDebug(`${type}(${id}): parent: ${parentId} scope: ${cId}`);
+    process._rawDebug(`${type}(${id}): trigger: ${triggerId} scope: ${cId}`);
   }
 }).enable();
 
@@ -298,8 +320,8 @@ net.createServer(c => {}).listen(8080);
 Output hitting the server with `nc localhost 8080`:
 
 ```
-TCPWRAP(2): parent: 1 scope: 1
-TCPWRAP(4): parent: 2 scope: 0
+TCPWRAP(2): trigger: 1 scope: 1
+TCPWRAP(4): trigger: 2 scope: 0
 ```
 
 The second `TCPWRAP` is the new connection from the client. When a new
@@ -307,7 +329,7 @@ connection is made the `TCPWrap` instance is immediately constructed. This
 happens outside of any JavaScript stack (side note: a `currentId()` of `0`
 means it's being executed in the void, with no JavaScript stack above it). With
 only that information it would be impossible to link resources together in
-terms of what caused them to be created. So `parentId` is given the task of
+terms of what caused them to be created. So `triggerId` is given the task of
 propagating what other handle is responsible for the new resource's existence.
 
 Below is another example with additional information about the calls to
@@ -318,10 +340,10 @@ elaborate to make calling context easier to see.
 ```js
 let ws = 0;
 async_hooks.createHook({
-  init: (id, type, parentId) => {
+  init: (id, type, triggerId) => {
     const cId = async_hooks.currentId();
     process._rawDebug(' '.repeat(ws) +
-                      `${type}(${id}): parent: ${parentId} scope: ${cId}`);
+                      `${type}(${id}): trigger: ${triggerId} scope: ${cId}`);
   },
   before: (id) => {
     print(' '.repeat(ws) + 'before: ', id);
@@ -344,17 +366,17 @@ net.createServer(() => {}).listen(8080, () => {
 Output from only starting the server:
 
 ```
-TCPWRAP(2): parent: 1 scope: 1
+TCPWRAP(2): trigger: 1 scope: 1
 # .listen()
-TickObject(3): parent: 1 scope: 1
+TickObject(3): trigger: 1 scope: 1
 before:  3
-  Timeout(4): parent: 3 scope: 3
-  TIMERWRAP(5): parent: 3 scope: 3
+  Timeout(4): trigger: 3 scope: 3
+  TIMERWRAP(5): trigger: 3 scope: 3
 after:   3
 before:  5
   before:  4
-    TTYWRAP(6): parent: 4 scope: 4
-    SIGNALWRAP(7): parent: 4 scope: 4
+    TTYWRAP(6): trigger: 4 scope: 4
+    SIGNALWRAP(7): trigger: 4 scope: 4
 >>> 4
   after:   4
 after:   5
@@ -376,7 +398,7 @@ completely asynchronous API the user's callback is placed in a
 `process.nextTick()`.
 
 The graph only shows **when** a resource was created. Not **why**. The later is
-what `parentId` is meant to communicate.
+what `triggerId` is meant to communicate.
 
 
 #### `before(id)`
@@ -477,7 +499,7 @@ MaybeLocal<Value> node::MakeCallback(Isolate* isolate,
 There is also a JS API to allow for conceptual correctness. For example, if a
 request batches calls under the hood this would still allow for each request
 to trigger the callbacks individually so that the callback associated with
-each bach request execute inside the correct parent.
+each bach request execute inside the correct trigger.
 
 This cannot be enforced in any way. It is up to the implementer to make sure
 all of the callbacks are placed and called at the correct time.
@@ -501,12 +523,12 @@ class MyClass {
 ```
 
 
-#### `async_hooks.emitInit(id, handle, type[, parentId])`
+#### `async_hooks.emitInit(id, handle, type[, triggerId])`
 
 * `id` {Number} Generated by calling `newUid()`
 * `handle` {Object}
 * `type` {String}
-* `parentId` {Number} **Default:** `currentId()`
+* `triggerId` {Number} **Default:** `currentId()`
 * Return: {Undefined}
 
 Emit that a handle is being initialized. `id` should be a value returned by
@@ -521,8 +543,8 @@ class Foo {
 }
 ```
 
-In the unusual circumstance that the embedder needs to define a different
-parent id than `currentId()`, they can pass in that id manually.
+In the circumstance that the embedder needs to define a different trigger id
+than `currentId()`, they can pass in that id manually.
 
 It is suggested to have `emitInit()` be the last call in the object's
 constructor.
@@ -546,7 +568,7 @@ MyThing.prototype.done = function done() {
   // handle wrapping the id that's been passed.
   async_hooks.emitBefore(this.asyncId);
 
-  // Store the current parent id then set the global current id to the id
+  // Store the current trigger id then set the global current id to the id
   // that was assigned when this object was instantiated.
   const previous_id = async_hooks.currentId();
   async_hooks.setCurrentId(this.asyncId);
@@ -622,7 +644,7 @@ these JS handles are linked to the `TimerWrap` instance.
 ### Native Modules
 
 Existing native modules that call `node::MakeCallback` today will always have
-their parent id as `1`. Which is the root id. There will be two native APIs
+their trigger id as `1`. Which is the root id. There will be two native APIs
 that users can use. One will be a static API and another will be a class that
 users can inherit from.
 
